@@ -16,8 +16,10 @@ Run it (from this directory, or with the package installed):
 
     uv run serve_judge.py --model convaiinnovations/laya --port 8081
 
-The model is loaded once at startup; inference is serialized by a lock because a
-single MLX ``Agent`` is not safe to drive from concurrent threads.
+The model is loaded once at startup and then warmed with a throwaway inference
+per question type, so the first real request does not pay MLX's lazy pipeline
+setup; inference is serialized by a lock because a single MLX ``Agent`` is not
+safe to drive from concurrent threads.
 """
 
 import argparse
@@ -34,6 +36,56 @@ from laya_mlx.agent import DTYPES, Agent
 MAX_BODY_BYTES = 8 * 1024 * 1024
 
 log = logging.getLogger("serve_judge")
+
+# Throwaway requests mirroring what the proxy actually sends (doc §4): one
+# `choice` question for single-tool mode, two `noul` questions for batch mode.
+# Both shapes are run so whichever mode the proxy is configured for meets a
+# warm model on its first real request.
+WARMUP_STATE = (
+    "User: What is the weather in Paris today?\n\n"
+    "Question: Should this tool be kept or discarded based on the user prompt and context?\n"
+    "Tool:\n1. get_weather\n   - Get the current weather for a city."
+)
+WARMUP_CHOICE = {
+    "decision": {
+        "type": "choice",
+        "instructions": "Should this tool be kept or discarded based on the user prompt and context?",
+        "criteria": ["keep", "discard"],
+    }
+}
+WARMUP_NOUL = {
+    name: {"type": "noul", "instructions": f"Keep {name} tool?"}
+    for name in ("Read", "get_weather")
+}
+
+
+def warmup(agent):
+    """Run one throwaway inference per question type before the port is bound.
+
+    MLX builds its Metal pipelines and allocates its buffers on first execution,
+    so the first ``POST /judge`` after a restart costs noticeably more than
+    steady state. Against the proxy's 50ms default ``timeout_ms`` that one-off
+    can tip the first request into fail-open, which silently keeps every tool.
+    Paying it here also proves the loaded model can actually answer, extending
+    the load-before-bind contract above: startup fails loudly rather than
+    serving 500s.
+
+    Returns the total warm-up time in milliseconds.
+    """
+    total_ms = 0.0
+    for label, questions in (("choice", WARMUP_CHOICE), ("noul", WARMUP_NOUL)):
+        started = time.perf_counter()
+        answers = agent.system_one(WARMUP_STATE, questions)["answers"]
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        total_ms += elapsed_ms
+        if set(answers) != set(questions):
+            # Same check `do_POST` applies, so a model that cannot answer is
+            # caught before the port opens rather than on the first client.
+            raise RuntimeError(
+                f"warm-up ({label}) answered {sorted(answers)}, expected {sorted(questions)}"
+            )
+        log.info("warm-up %s: %d question(s) in %.1fms", label, len(answers), elapsed_ms)
+    return total_ms
 
 
 def parse_request(payload):
@@ -161,6 +213,11 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="skip the startup inference; the first /judge then pays MLX's lazy setup",
+    )
     parser.add_argument("--verbose", action="store_true", help="log every HTTP request")
     return parser
 
@@ -183,6 +240,19 @@ def main(argv=None):
         subfolder=args.subfolder,
         batch_size=args.batch_size,
     )
+
+    # Still before the bind: warm-up failures mean every later request would
+    # 500, and an un-warmed port would answer the first call too slowly to be
+    # useful to the proxy's 50ms default timeout.
+    if args.no_warmup:
+        log.info("warm-up skipped (--no-warmup)")
+    else:
+        try:
+            log.info("warming up on %s (one pass per question type)", args.device)
+            log.info("warm-up done in %.1fms", warmup(agent))
+        except Exception as exc:  # noqa: BLE001 - any failure here would 500 every request
+            log.error("warm-up failed: %s", exc, exc_info=True)
+            return 1
 
     server = ThreadingHTTPServer((args.host, args.port), JudgeHandler)
     server.agent = agent
