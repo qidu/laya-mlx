@@ -187,6 +187,73 @@ uv run laya-mlx predict \
   --questions examples/questions.json
 ```
 
+## HTTP sidecar server
+
+`serve_judge.py` exposes Laya as an HTTP service for the proxy's judge sidecar protocol and
+the Clef (System One) contract.
+
+```bash
+uv run serve_judge.py --model aac6fef/laya-mlx --port 8081
+```
+
+### Endpoints
+
+| Method | Path | Input | Output |
+|---|---|---|---|
+| `POST` | `/judge` | `{"state": "...", "questions": {<qid>: <question>}}` | `{<qid>: <answer>}` (bare Laya answers map) |
+| `POST` | `/decision` | `{"model": "...", "state": "...", "questions": {...}, "images": [...]?}` | `{"model": "...", "answers": {...}, "usage": {...}}` (Clef envelope) |
+| `GET` | `/health` | — | `{"status": "healthy", "model_version": "...", "mode": "choice+noul"}` |
+
+### `/judge` — sidecar protocol
+
+Passes questions through to `Agent.system_one` and returns the `answers` map unchanged.
+Use this when the proxy calls the judge for tool filtering. `choice` accepts the Laya
+extension of a bare label list for `criteria`; `noul` and `score` follow the standard
+schema. No `model` or `usage` fields are returned.
+
+```bash
+curl -X POST http://127.0.0.1:8081/judge \
+  -H 'Content-Type: application/json' \
+  -d '{"state": "I was billed twice.", "questions": {"topic": {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}}}'
+```
+
+### `/decision` — Clef (System One) contract
+
+Validates the request against the Clef (System One) input schema and returns the Clef
+output envelope. The schemas themselves live with the proxy that defines this contract,
+not in this repository.
+
+Key differences from `/judge`:
+
+- `model` is required (any non-empty string; echoed back; not restricted to Clef's
+  selectors so the endpoint can front Laya or another judge).
+- `state` accepts a string, object, or array; structured state is JSON-encoded.
+- `choice` **requires** the object form of `criteria` (label → description map); the
+  bare list accepted by Laya is rejected with `400`.
+- `images` is accepted and validated (data URLs or base64 objects) but dropped with a
+  warning log: Laya is a text-only encoder.
+- Answers are narrowed to the fields Clef defines (`type`, `choice`/`score`/`noul`,
+  `probabilities`, `legend`, `confidence`); Laya's `action` field is dropped.
+- `noul` answers do not include `confidence` (Clef does not define it for this type).
+
+```bash
+curl -X POST http://127.0.0.1:8081/decision \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "laya",
+    "state": "I was billed twice. Please refund the duplicate.",
+    "questions": {
+      "topic": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": "invoices", "technical": "bugs"}},
+      "urgency": {"type": "score", "instructions": "How urgent?", "criteria": ["low", "high"]},
+      "refund": {"type": "noul", "instructions": "Ask for money back?"}
+    }
+  }'
+```
+
+Both endpoints serialize inference with a lock; concurrent requests queue. The
+server loads the model once at startup. `--dtype`, `--device`, `--batch-size`,
+`--revision`, and `--subfolder` work the same as the CLI.
+
 ## Export an MLX checkpoint
 
 ```bash

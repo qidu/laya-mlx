@@ -3,14 +3,25 @@
 Serves the protocol in the proxy's
 ``docs/architecture/design_tool_judge_sidecar_protocol.md``:
 
-    POST /judge   {"state": ..., "questions": {<qid>: <question>}} -> {<qid>: <answer>}
-    GET  /health  -> {"status": "healthy", "model_version": ..., "mode": ...}
+    POST /judge     {"state": ..., "questions": {<qid>: <question>}} -> {<qid>: <answer>}
+    POST /decision  {"model": ..., "state": ..., "questions": {...}}
+                    -> {"model": ..., "answers": {...}, "usage": {...}}
+    GET  /health    -> {"status": "healthy", "model_version": ..., "mode": ...}
 
-The question and answer objects are passed through unchanged: Laya's answer for a
-``choice`` question already carries ``type``/``confidence``/``action``/``choice``/
-``probabilities`` (doc §2.4) and for ``noul`` ``type``/``confidence``/``action``/
-``noul`` (doc §2.5). The wrapper only unwraps the ``answers`` map from Laya's
-envelope and drops ``model``/``usage``.
+For ``/judge`` the question and answer objects are passed through unchanged: Laya's
+answer for a ``choice`` question already carries ``type``/``confidence``/``action``/
+``choice``/``probabilities`` (doc §2.4) and for ``noul`` ``type``/``confidence``/
+``action``/``noul`` (doc §2.5). The wrapper only unwraps the ``answers`` map from
+Laya's envelope and drops ``model``/``usage``.
+
+``/decision`` serves the Clef (System One) contract in the proxy's
+``docs/api/decision/clef-schema-input.json`` and ``clef-schema-output.json`` instead,
+for general judging rather than tool filtering. It validates the request against the
+input schema and returns the ``{model, answers, usage}`` envelope the output schema
+requires, dropping Laya's ``action`` field, which Clef has no concept of. ``model`` is
+required but not restricted to Clef's selectors -- any name is accepted and echoed
+back, so the endpoint can front Laya or a future judge. ``images`` is accepted and
+ignored: Clef sends images ahead of the state, but Laya is a text-only encoder.
 
 Run it (from this directory, or with the package installed):
 
@@ -32,8 +43,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from laya_mlx import __version__
 from laya_mlx.agent import DTYPES, Agent
+from laya_mlx.common import QTYPES
 
 MAX_BODY_BYTES = 8 * 1024 * 1024
+MAX_QUESTIONS = 64
+MAX_IMAGES = 4
+
+# Fields the Clef output schema requires per answer type. Laya additionally returns
+# ``action``, which is not part of Clef and is dropped from ``/decision`` responses.
+ANSWER_FIELDS = {
+    "noul": ("type", "noul"),
+    "choice": ("type", "choice", "probabilities", "confidence"),
+    "score": ("type", "score", "legend", "probabilities", "confidence"),
+}
 
 log = logging.getLogger("serve_judge")
 
@@ -104,6 +126,144 @@ def parse_request(payload):
     return state, questions
 
 
+def _validate_question(qid, question):
+    """Validate one question against the Clef input schema.
+
+    A valid Clef question is also a valid Laya question, so nothing is rewritten:
+    both spell the option set ``criteria`` (a label -> description map for
+    ``choice``, an ordered level list for ``score``, ``{"true": ..., "false": ...}``
+    for ``noul``) and carry the question text in ``instructions``.
+    """
+    if not isinstance(question, dict):
+        raise ValueError(f"Question {qid!r} must be a JSON object")
+    qtype = question.get("type")
+    if qtype not in QTYPES:
+        raise ValueError(f"Question {qid!r}: 'type' must be one of {sorted(QTYPES)}, got {qtype!r}")
+    instructions = question.get("instructions")
+    if isinstance(instructions, str):
+        if not instructions:
+            raise ValueError(f"Question {qid!r}: 'instructions' must not be empty")
+    elif not isinstance(instructions, (dict, list)):
+        raise ValueError(
+            f"Question {qid!r}: 'instructions' must be a non-empty string or an object/array"
+        )
+    criteria = question.get("criteria")
+    if qtype == "choice":
+        if not isinstance(criteria, dict):
+            raise ValueError(f"Question {qid!r}: choice 'criteria' must be an object of option -> description")
+        if not 2 <= len(criteria) <= 255:
+            raise ValueError(
+                f"Question {qid!r}: choice 'criteria' needs 2 to 255 options, got {len(criteria)}"
+            )
+        if not all(isinstance(label, str) and label for label in criteria):
+            raise ValueError(f"Question {qid!r}: choice option ids must be non-empty strings")
+    elif qtype == "score":
+        if not isinstance(criteria, list):
+            raise ValueError(f"Question {qid!r}: score 'criteria' must be an ordered array of levels")
+        if not 2 <= len(criteria) <= 10:
+            raise ValueError(
+                f"Question {qid!r}: score 'criteria' needs 2 to 10 levels, got {len(criteria)}"
+            )
+    elif criteria is not None:
+        if not isinstance(criteria, dict):
+            raise ValueError(
+                f"Question {qid!r}: noul 'criteria' must be an object describing 'true' and 'false'"
+            )
+        unknown = sorted(set(criteria) - {"true", "false"})
+        if unknown:
+            raise ValueError(f"Question {qid!r}: noul 'criteria' has unknown keys {unknown}")
+
+
+def _validate_images(images):
+    """Validate the Clef ``images`` extension and return how many were sent.
+
+    Callers drop them: Laya is a text-only encoder, so an image cannot reach the
+    decision. The count comes back so the caller can say so out loud rather than
+    answer as if the images had no effect on the request.
+    """
+    if images is None:
+        return 0
+    if not isinstance(images, list):
+        raise ValueError("'images' must be an array")
+    if len(images) > MAX_IMAGES:
+        raise ValueError(f"'images' accepts at most {MAX_IMAGES} items, got {len(images)}")
+    for i, image in enumerate(images):
+        if isinstance(image, str):
+            if not image.lower().startswith("data:"):
+                raise ValueError(f"Image {i}: a string image must be a data URL")
+        elif isinstance(image, dict):
+            for field in ("content_type", "base64"):
+                if not isinstance(image.get(field), str):
+                    raise ValueError(f"Image {i}: '{field}' must be a string")
+        else:
+            raise ValueError(f"Image {i}: must be a data URL string or a base64 image object")
+    return len(images)
+
+
+def parse_decision_request(payload):
+    """Validate a ``POST /decision`` body against the Clef input schema.
+
+    Returns ``(model, state, questions)``, with ``questions`` ready to hand to
+    ``Agent.system_one`` unchanged. ``model`` is only required to be a non-empty
+    string -- it is echoed back rather than matched against Clef's selectors, so the
+    endpoint can front Laya today and another judge later. ``state`` may be a string,
+    object, or array; Laya serializes the structured forms before encoding.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object")
+    model = payload.get("model")
+    if not isinstance(model, str) or not model:
+        raise ValueError("Request is missing a non-empty string 'model'")
+    state = payload.get("state")
+    if state is None:
+        raise ValueError("Request is missing 'state'")
+    if isinstance(state, str):
+        if not state:
+            raise ValueError("'state' must not be an empty string")
+    elif not isinstance(state, (dict, list)):
+        raise ValueError("'state' must be a string, object, or array")
+    questions = payload.get("questions")
+    if not isinstance(questions, dict) or not questions:
+        raise ValueError("Request is missing a non-empty 'questions' object")
+    if len(questions) > MAX_QUESTIONS:
+        raise ValueError(f"Too many questions: {len(questions)} (max {MAX_QUESTIONS})")
+    for qid, question in questions.items():
+        _validate_question(qid, question)
+    images = _validate_images(payload.get("images"))
+    if images:
+        log.warning("/decision dropped %d image(s): the encoder is text-only", images)
+    return model, state, questions
+
+
+def clef_response(model, result):
+    """Build the Clef output envelope from Laya's ``system_one`` result.
+
+    Laya's per-answer shapes already match Clef's for ``choice`` and ``score``; the
+    only difference is that Laya also returns ``action`` (and a ``confidence`` on
+    ``noul``, which Clef does not define), so answers are narrowed to the fields the
+    output schema names. A field the schema requires but Laya did not produce is an
+    error rather than something to paper over with a default.
+    """
+    answers = {}
+    for qid, answer in result["answers"].items():
+        fields = ANSWER_FIELDS.get(answer.get("type"))
+        if fields is None:
+            raise ValueError(f"Question {qid!r}: unexpected answer type {answer.get('type')!r}")
+        missing = [field for field in fields if field not in answer]
+        if missing:
+            raise ValueError(f"Question {qid!r}: {answer['type']} answer is missing {missing}")
+        answers[qid] = {field: answer[field] for field in fields}
+    usage = result["usage"]
+    return {
+        "model": model,
+        "answers": answers,
+        "usage": {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+        },
+    }
+
+
 class JudgeHandler(BaseHTTPRequestHandler):
     server_version = f"laya-judge/{__version__}"
 
@@ -123,7 +283,8 @@ class JudgeHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
-        if self.path.split("?", 1)[0] != "/judge":
+        path = self.path.split("?", 1)[0]
+        if path not in ("/judge", "/decision"):
             self.send_error(404, "Not Found")
             return
         try:
@@ -132,11 +293,23 @@ class JudgeHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
         try:
-            state, questions = parse_request(payload)
+            if path == "/judge":
+                # /judge answers with the bare answers map, so there is no model to echo.
+                model = None
+                state, questions = parse_request(payload)
+            else:
+                model, state, questions = parse_decision_request(payload)
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
+        self._answer(model, state, questions)
 
+    def _answer(self, model, state, questions):
+        """Run inference for either endpoint and write the answer.
+
+        ``model`` is ``None`` for ``/judge`` (bare answers map) and the requested
+        selector for ``/decision``, which wraps the answers in Clef's envelope.
+        """
         started = time.perf_counter()
         try:
             with self.server.lock:
@@ -172,7 +345,18 @@ class JudgeHandler(BaseHTTPRequestHandler):
             elapsed_ms,
             result.get("usage", {}).get("input_tokens", -1),
         )
-        self._send_json(200, answers)
+        if model is None:
+            self._send_json(200, answers)
+            return
+        try:
+            body = clef_response(model, result)
+        except (KeyError, ValueError) as exc:
+            # Laya produced an answer Clef has no shape for: a server-side bug, so fail
+            # loudly rather than return a partial envelope.
+            log.error("cannot render the Clef response: %s", exc, exc_info=True)
+            self._send_json(500, {"error": f"cannot render the Clef response: {exc}"})
+            return
+        self._send_json(200, body)
 
     def _read_json(self):
         raw_length = self.headers.get("Content-Length")
