@@ -289,6 +289,19 @@ Run GPU measurements sequentially. Unit tests use small random models and includ
 
 GitHub Actions runs small-model CPU tests on a macOS arm64 runner. Full checkpoint GPU benchmarks are measured locally and are not part of hosted CI.
 
+### Device comparison
+
+`performance_compare.sh` measures the judge sidecar's own workload on each MLX device in turn, so the numbers correspond to what `serve_judge.py` serves rather than to a synthetic tensor shape. It times the two shapes the sidecar warms up on — one `choice` question for single-tool mode and two `noul` questions for batch mode — with 3 warm-up calls and 20 timed calls per shape, and reports milliseconds per call, questions per second, and the answer keys returned; the first checkpoint block also prints peak MLX allocation.
+
+It runs `.venv/bin/python` from this directory, and both `PYTHONPATH=.` and that interpreter path are relative to the repository root, so create the environment first (see Development install above):
+
+```bash
+cd submodules/laya-mlx
+./performance_compare.sh
+```
+
+`device=gpu` and `device=metal` select the same MLX device — `Agent` maps both to `mx.gpu` — so those two rows should agree, and the informative comparison is GPU against CPU. Two checkpoints are covered in separate blocks: `aac6fef/laya-multilingual-mlx` (mmBERT-base, 322M, 1,024 context) and the original `convaiinnovations/laya` (ModernBERT-large, 421M, 512 context). Rows within a block compare devices; rows across blocks compare checkpoints. Like the published figures, these are local single-run measurements on one machine with normal OS activity, and carry the same limits as [BENCHMARKS.md](https://github.com/mizorewww/laya-mlx/blob/main/BENCHMARKS.md).
+
 ## Performance research
 
 The performance investigations include both mathematical analysis and independent local experiments:
