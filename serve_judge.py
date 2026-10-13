@@ -299,6 +299,7 @@ class JudgeHandler(BaseHTTPRequestHandler):
                 state, questions = parse_request(payload)
             else:
                 model, state, questions = parse_decision_request(payload)
+                log.info("received /decision request: model=%s, %d question(s)", model, len(questions))
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -329,6 +330,16 @@ class JudgeHandler(BaseHTTPRequestHandler):
             return
         elapsed_ms = (time.perf_counter() - started) * 1000
 
+        # Log which endpoint is being used (model is None for /judge, set for /decision)
+        endpoint = "/decision" if model is not None else "/judge"
+        log.info(
+            "judged %d question(s) via %s in %.1fms (%d input tokens)",
+            len(questions),
+            endpoint,
+            elapsed_ms,
+            result.get("usage", {}).get("input_tokens", -1),
+        )
+
         answers = result.get("answers")
         if not isinstance(answers, dict) or set(answers) != set(questions):
             log.error(
@@ -339,12 +350,6 @@ class JudgeHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "model returned answers for a different question set"})
             return
 
-        log.info(
-            "judged %d question(s) in %.1fms (%d input tokens)",
-            len(answers),
-            elapsed_ms,
-            result.get("usage", {}).get("input_tokens", -1),
-        )
         if model is None:
             self._send_json(200, answers)
             return
